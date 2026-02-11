@@ -1,7 +1,7 @@
 {
     "id": "dhcp",
     "name": "DHCP Server",
-    "version": "0.1.0",
+    "version": "0.1.1",
     "description": "ISC DHCP server management with multi-interface subnets, pools, static reservations and live lease monitoring",
     "author": "MADMIN Team",
     "system_dependencies": {
