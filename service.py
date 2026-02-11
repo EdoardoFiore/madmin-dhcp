@@ -269,6 +269,64 @@ class DhcpService:
 
     # --- Service Management ---
 
+    def _get_journal_errors(self, lines: int = 20) -> str:
+        """
+        Get recent journal entries for isc-dhcp-server.
+        Used to surface meaningful error messages on failure.
+        """
+        try:
+            result = subprocess.run(
+                ["journalctl", "-u", SERVICE_NAME, "-n", str(lines),
+                 "--no-pager", "-o", "cat"],
+                capture_output=True, text=True, timeout=5
+            )
+            return result.stdout.strip()
+        except Exception:
+            return ""
+
+    def _parse_dhcpd_error(self, journal: str) -> str:
+        """
+        Extract the most relevant error from dhcpd journal output.
+        Returns a user-friendly error message.
+        """
+        lines = journal.split('\n')
+        error_lines = []
+        for line in lines:
+            line_lower = line.lower()
+            # Capture meaningful error lines
+            if any(kw in line_lower for kw in [
+                'no subnet declaration',
+                'not configured to listen',
+                'exiting',
+                'failed',
+                'error',
+                'cannot',
+                'unable',
+                'ignoring requests on',
+            ]):
+                cleaned = line.strip()
+                if cleaned and cleaned not in error_lines:
+                    error_lines.append(cleaned)
+
+        if error_lines:
+            return " | ".join(error_lines[:5])
+        return "Servizio terminato inaspettatamente. Controlla il journal per dettagli."
+
+    def _check_service_alive(self) -> bool:
+        """
+        Check if isc-dhcp-server is actually running (not crashed).
+        """
+        try:
+            import time
+            time.sleep(2)  # Wait for dhcpd to either stabilize or crash
+            result = subprocess.run(
+                ["systemctl", "is-active", SERVICE_NAME],
+                capture_output=True, text=True
+            )
+            return result.stdout.strip() == "active"
+        except Exception:
+            return False
+
     def get_service_status(self) -> Dict:
         """Get isc-dhcp-server service status."""
         status = {
@@ -309,16 +367,24 @@ class DhcpService:
         return status
 
     def start_service(self) -> tuple:
-        """Start isc-dhcp-server. Returns (success, message)."""
+        """Start isc-dhcp-server with post-start health check."""
         try:
             result = subprocess.run(
                 ["systemctl", "start", SERVICE_NAME],
                 capture_output=True, text=True, timeout=15
             )
-            if result.returncode == 0:
-                return True, "Service started"
-            else:
-                return False, result.stderr.strip() or "Failed to start"
+            if result.returncode != 0:
+                journal = self._get_journal_errors()
+                error = self._parse_dhcpd_error(journal)
+                return False, f"Avvio fallito: {error}"
+
+            # Post-start health check
+            if not self._check_service_alive():
+                journal = self._get_journal_errors()
+                error = self._parse_dhcpd_error(journal)
+                return False, f"Il servizio è crashato subito dopo l'avvio: {error}"
+
+            return True, "Service started"
         except Exception as e:
             return False, str(e)
 
@@ -337,40 +403,118 @@ class DhcpService:
             return False, str(e)
 
     def restart_service(self) -> tuple:
-        """Restart isc-dhcp-server. Returns (success, message)."""
+        """Restart isc-dhcp-server with post-start health check."""
         try:
             result = subprocess.run(
                 ["systemctl", "restart", SERVICE_NAME],
                 capture_output=True, text=True, timeout=15
             )
-            if result.returncode == 0:
-                return True, "Service restarted"
-            else:
-                return False, result.stderr.strip() or "Failed to restart"
+            if result.returncode != 0:
+                journal = self._get_journal_errors()
+                error = self._parse_dhcpd_error(journal)
+                return False, f"Riavvio fallito: {error}"
+
+            # Post-start health check
+            if not self._check_service_alive():
+                journal = self._get_journal_errors()
+                error = self._parse_dhcpd_error(journal)
+                return False, f"Il servizio è crashato subito dopo il riavvio: {error}"
+
+            return True, "Service restarted"
         except Exception as e:
             return False, str(e)
 
+    def _validate_subnet_interface_match(
+        self, subnets: list, interfaces: List[Dict]
+    ) -> tuple:
+        """
+        Pre-flight check: verify each subnet's network matches
+        the IP address of the bound interface.
+        Returns (is_valid, error_message).
+        """
+        # Build interface IP map
+        iface_networks = {}
+        for iface in interfaces:
+            for addr_cidr in iface.get("addresses", []):
+                try:
+                    iface_net = ipaddress.IPv4Network(addr_cidr, strict=False)
+                    iface_networks.setdefault(iface["name"], []).append(iface_net)
+                except ValueError:
+                    continue
+
+        errors = []
+        for subnet in subnets:
+            if subnet.interface not in iface_networks:
+                errors.append(
+                    f"Subnet '{subnet.name}': interfaccia '{subnet.interface}' "
+                    f"non trovata o senza indirizzo IPv4"
+                )
+                continue
+
+            try:
+                subnet_net = ipaddress.IPv4Network(subnet.network, strict=False)
+            except ValueError:
+                errors.append(
+                    f"Subnet '{subnet.name}': network '{subnet.network}' non valido"
+                )
+                continue
+
+            # Check if subnet matches any IP on the interface
+            match = False
+            for iface_net in iface_networks[subnet.interface]:
+                if subnet_net.overlaps(iface_net):
+                    match = True
+                    break
+
+            if not match:
+                iface_ips = ", ".join(
+                    str(n) for n in iface_networks[subnet.interface]
+                )
+                errors.append(
+                    f"Subnet '{subnet.name}' ({subnet.network}) non corrisponde "
+                    f"all'indirizzo di {subnet.interface} ({iface_ips}). "
+                    f"La subnet deve contenere l'IP dell'interfaccia."
+                )
+
+        if errors:
+            return False, " | ".join(errors)
+        return True, "OK"
+
     async def apply_config(self, session: AsyncSession) -> tuple:
         """
-        Full apply workflow: generate → validate → update interfaces → restart.
+        Full apply workflow: validate interfaces → generate → validate syntax → restart.
         Returns (success, message).
         """
         try:
-            # 1. Generate and write config
+            # 0. Load enabled subnets for pre-flight check
+            result = await session.execute(
+                select(DhcpSubnet).where(DhcpSubnet.enabled == True)
+            )
+            enabled_subnets = result.scalars().all()
+
+            # 1. Pre-flight: validate subnet-interface match
+            interfaces = self.get_physical_interfaces()
+            valid, msg = self._validate_subnet_interface_match(
+                enabled_subnets, interfaces
+            )
+            if not valid:
+                return False, f"Errore configurazione: {msg}"
+
+            # 2. Generate and write config
             await self.write_config(session)
 
-            # 2. Update interfaces file
+            # 3. Update interfaces file
             await self.update_interfaces_config(session)
 
-            # 3. Validate config
+            # 4. Validate config syntax
             valid, msg = self.validate_config()
             if not valid:
                 return False, f"Config validation failed: {msg}"
 
-            # 4. Restart service
+            # 5. Restart service (includes health check)
             success, msg = self.restart_service()
             if not success:
-                return False, f"Service restart failed: {msg}"
+                return False, msg
 
             return True, "Configuration applied and service restarted"
 

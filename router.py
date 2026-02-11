@@ -96,10 +96,22 @@ async def apply_config(
 
 @router.post("/start")
 async def start_service(
+    session: AsyncSession = Depends(get_session),
     _user: User = Depends(require_permission("dhcp.manage"))
 ):
-    """Start DHCP service."""
-    success, message = dhcp_service.start_service()
+    """Start DHCP service (applies config first)."""
+    # Check for enabled subnets
+    result = await session.execute(
+        select(func.count(DhcpSubnet.id)).where(DhcpSubnet.enabled == True)
+    )
+    if (result.scalar() or 0) == 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Impossibile avviare: nessuna subnet abilitata configurata"
+        )
+
+    # Apply config before starting
+    success, message = await dhcp_service.apply_config(session)
     if not success:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -124,10 +136,22 @@ async def stop_service(
 
 @router.post("/restart")
 async def restart_service(
+    session: AsyncSession = Depends(get_session),
     _user: User = Depends(require_permission("dhcp.manage"))
 ):
-    """Restart DHCP service."""
-    success, message = dhcp_service.restart_service()
+    """Restart DHCP service (re-applies config)."""
+    # Check for enabled subnets
+    result = await session.execute(
+        select(func.count(DhcpSubnet.id)).where(DhcpSubnet.enabled == True)
+    )
+    if (result.scalar() or 0) == 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Impossibile riavviare: nessuna subnet abilitata configurata"
+        )
+
+    # Apply config before restarting
+    success, message = await dhcp_service.apply_config(session)
     if not success:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,

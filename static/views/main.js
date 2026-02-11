@@ -101,11 +101,11 @@ async function renderDashboard(container) {
             <!-- Subnets Table -->
             <div class="card">
                 <div class="card-header d-flex justify-content-between align-items-center">
-                    <h3 class="card-title"><i class="ti ti-network me-2"></i>Subnet DHCP</h3>
+                    <h3 class="card-title"><i class="ti ti-affiliate me-2"></i>Subnet DHCP</h3>
                     <div class="d-flex gap-2">
                         ${canManage ? `
-                        <button class="btn btn-outline-primary" id="btn-apply">
-                            <i class="ti ti-refresh me-1"></i>Applica Config
+                        <button class="btn btn-outline-primary" id="btn-apply" title="Rigenera dhcpd.conf dal database e riavvia il servizio">
+                            <i class="ti ti-reload me-1"></i>Applica Config
                         </button>
                         <button class="btn btn-primary" id="btn-new-subnet">
                             <i class="ti ti-plus me-1"></i>Nuova Subnet
@@ -157,7 +157,7 @@ function renderSubnetsTable(subnets) {
             <table class="table table-vcenter card-table table-hover">
                 <thead>
                     <tr>
-                        <th style="width: 30px;"></th>
+                        <th style="width: 50px;">Attiva</th>
                         <th>Nome</th>
                         <th>Network</th>
                         <th>Interfaccia</th>
@@ -170,10 +170,15 @@ function renderSubnetsTable(subnets) {
                 </thead>
                 <tbody>
                     ${subnets.map(s => `
-                        <tr class="subnet-row" data-id="${s.id}" style="cursor: pointer;">
-                            <td>
-                                <span class="status-dot ${s.enabled ? 'bg-success' : 'bg-secondary'}"
-                                      title="${s.enabled ? 'Abilitata' : 'Disabilitata'}"></span>
+                        <tr class="subnet-row ${!s.enabled ? 'text-muted' : ''}" data-id="${s.id}" style="cursor: pointer;">
+                            <td onclick="event.stopPropagation();">
+                                ${canManage ? `
+                                <label class="form-check form-switch mb-0">
+                                    <input class="form-check-input subnet-toggle" type="checkbox" 
+                                           data-id="${s.id}" ${s.enabled ? 'checked' : ''}>
+                                </label>` : `
+                                <span class="status-dot ${s.enabled ? 'bg-success' : 'bg-secondary'}"></span>
+                                `}
                             </td>
                             <td>
                                 <a href="#dhcp/${s.id}" class="text-reset">
@@ -301,6 +306,13 @@ function setupDashboardActions(status) {
 
     // Apply config
     document.getElementById('btn-apply')?.addEventListener('click', async () => {
+        if (!await confirmDialog(
+            'Applicare la configurazione?',
+            'Verrà rigenerato il file dhcpd.conf con tutte le subnet abilitate, ' +
+            'validata la sintassi e riavviato il servizio DHCP. ' +
+            'Solo le subnet con il toggle attivo saranno incluse.'
+        )) return;
+
         const btn = document.getElementById('btn-apply');
         btn.disabled = true;
         btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>Applicando...';
@@ -311,7 +323,7 @@ function setupDashboardActions(status) {
         } catch (err) {
             showToast(err.message, 'error');
             btn.disabled = false;
-            btn.innerHTML = '<i class="ti ti-refresh me-1"></i>Applica Config';
+            btn.innerHTML = '<i class="ti ti-reload me-1"></i>Applica Config';
         }
     });
 
@@ -342,6 +354,25 @@ function setupDashboardActions(status) {
                 showToast('Subnet eliminata', 'success');
                 await renderDashboard(currentContainer);
             } catch (err) { showToast(err.message, 'error'); }
+        });
+    });
+
+    // Subnet enable/disable toggle
+    document.querySelectorAll('.subnet-toggle').forEach(toggle => {
+        toggle.addEventListener('change', async (e) => {
+            const id = toggle.dataset.id;
+            const enabled = toggle.checked;
+            try {
+                await apiPatch(`/modules/dhcp/subnets/${id}`, { enabled });
+                showToast(
+                    enabled ? 'Subnet abilitata' : 'Subnet disabilitata — ricorda di applicare la config',
+                    enabled ? 'success' : 'warning'
+                );
+                await renderDashboard(currentContainer);
+            } catch (err) {
+                toggle.checked = !enabled; // Rollback
+                showToast(err.message, 'error');
+            }
         });
     });
 }
@@ -519,7 +550,7 @@ async function renderSubnetDetail(container, subnetId) {
                             </button>
                         </div>
                         <div id="leases-table-container">
-                            ${renderLeasesTable(leases)}
+                            ${renderLeasesTable(leases, hosts)}
                         </div>
                     </div>
                 </div>
@@ -597,7 +628,7 @@ function renderHostsTable(hosts, subnetId) {
         </div>`;
 }
 
-function renderLeasesTable(leases) {
+function renderLeasesTable(leases, hosts = []) {
     if (leases.length === 0) {
         return `
             <div class="text-center py-4 text-muted">
@@ -605,6 +636,9 @@ function renderLeasesTable(leases) {
                 <p class="mt-2">Nessun lease attivo</p>
             </div>`;
     }
+
+    // Build a set of reserved MACs for cross-reference
+    const reservedMacs = new Set(hosts.map(h => h.mac_address?.toLowerCase()));
 
     return `
         <div class="table-responsive">
@@ -617,11 +651,14 @@ function renderLeasesTable(leases) {
                         <th>Inizio</th>
                         <th>Scadenza</th>
                         <th>Stato</th>
+                        ${canReservations ? '<th class="w-1">Azioni</th>' : ''}
                     </tr>
                 </thead>
                 <tbody>
-                    ${leases.map(l => `
-                        <tr>
+                    ${leases.map(l => {
+        const isReserved = l.mac_address && reservedMacs.has(l.mac_address.toLowerCase());
+        return `
+                        <tr class="${isReserved ? 'fw-bold' : ''}">
                             <td><code>${l.ip_address}</code></td>
                             <td><code>${l.mac_address || '—'}</code></td>
                             <td>${l.hostname || '<span class="text-muted">—</span>'}</td>
@@ -632,8 +669,19 @@ function renderLeasesTable(leases) {
                                     ${l.state}
                                 </span>
                             </td>
-                        </tr>
-                    `).join('')}
+                            ${canReservations ? `
+                            <td>
+                                ${!isReserved && l.mac_address ? `
+                                <button class="btn btn-sm btn-ghost-primary btn-reserve-lease"
+                                        data-mac="${l.mac_address}" data-ip="${l.ip_address}"
+                                        data-hostname="${l.hostname || ''}" title="Crea prenotazione">
+                                    <i class="ti ti-pin me-1"></i>Prenota
+                                </button>` : `
+                                <span class="badge bg-blue-lt"><i class="ti ti-pin-filled me-1"></i>Prenotato</span>
+                                `}
+                            </td>` : ''}
+                        </tr>`;
+    }).join('')}
                 </tbody>
             </table>
         </div>`;
@@ -888,13 +936,38 @@ function setupSubnetDetailActions(subnet, subnetId) {
         btn.disabled = true;
         btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>Aggiornando...';
         try {
-            const leases = await apiGet(`/modules/dhcp/subnets/${subnetId}/leases`);
-            document.getElementById('leases-table-container').innerHTML = renderLeasesTable(leases);
+            const [leases, freshHosts] = await Promise.all([
+                apiGet(`/modules/dhcp/subnets/${subnetId}/leases`),
+                apiGet(`/modules/dhcp/subnets/${subnetId}/hosts`)
+            ]);
+            document.getElementById('leases-table-container').innerHTML = renderLeasesTable(leases, freshHosts);
+            setupReserveFromLeaseButtons(subnetId);
             // Update tab badge
             const tabBtn = document.getElementById('tab-leases');
             tabBtn.innerHTML = `<i class="ti ti-clock me-1"></i>Lease Attivi (${leases.length})`;
         } catch (err) { showToast(err.message, 'error'); }
         btn.disabled = false;
         btn.innerHTML = '<i class="ti ti-refresh me-1"></i>Aggiorna';
+    });
+
+    // Reserve-from-lease buttons
+    setupReserveFromLeaseButtons(subnetId);
+}
+
+function setupReserveFromLeaseButtons(subnetId) {
+    document.querySelectorAll('.btn-reserve-lease').forEach(btn => {
+        btn.addEventListener('click', () => {
+            // Pre-fill the new-host modal with lease data
+            const hostname = btn.dataset.hostname || `host-${btn.dataset.ip.split('.').pop()}`;
+            document.getElementById('new-host-name').value = hostname;
+            document.getElementById('new-host-mac').value = btn.dataset.mac;
+            document.getElementById('new-host-ip').value = btn.dataset.ip;
+            document.getElementById('new-host-desc').value = `Prenotato da lease attivo`;
+
+            // Reset modal title (in case it was changed by edit)
+            document.querySelector('#modal-new-host .modal-title').textContent = 'Nuova Prenotazione';
+
+            new bootstrap.Modal(document.getElementById('modal-new-host')).show();
+        });
     });
 }
