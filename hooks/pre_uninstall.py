@@ -59,6 +59,18 @@ def run():
         except Exception as e:
             errors.append(f"Failed to backup config: {e}")
 
+    # 4. Clean up lease files
+    for lease_file in [
+        Path("/var/lib/dhcp/dhcpd.leases"),
+        Path("/var/lib/dhcp/dhcpd.leases~"),
+    ]:
+        if lease_file.exists():
+            try:
+                lease_file.unlink()
+                logger.info(f"Removed {lease_file}")
+            except Exception as e:
+                logger.warning(f"Could not remove {lease_file}: {e}")
+
     # Report results
     if errors:
         for err in errors:
