@@ -43,7 +43,7 @@
     "menu": [
         {
             "label": "DHCP Server",
-            "icon": "ti ti-network",
+            "icon": "ti ti-affiliate",
             "route": "#dhcp"
         }
     ],
